@@ -72,7 +72,7 @@ pub async fn connect_provider(provider_name: &str) -> Result<ProviderConnection,
     }
 }
 
-/// Close a provider session (call on CDP connect failure).
+/// Close a provider session (call on CDP connect failure or browser close).
 pub async fn close_provider_session(session: &ProviderSession) {
     let client = reqwest::Client::new();
     match session.provider.as_str() {
@@ -129,6 +129,15 @@ pub async fn close_provider_session(session: &ProviderSession) {
         }
         _ => {}
     }
+}
+
+fn provider_error_code(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    value
+        .get("code")
+        .or_else(|| value.get("error").and_then(|e| e.get("code")))
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 async fn connect_browserbase() -> Result<(String, Option<ProviderSession>), String> {
@@ -280,16 +289,17 @@ async fn connect_kernel() -> Result<(String, Option<ProviderSession>), String> {
 
     let url = format!("{}/browsers", endpoint.trim_end_matches('/'));
 
-    let headless = env::var("KERNEL_HEADLESS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
-    let stealth = env::var("KERNEL_STEALTH")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let headless = parse_bool_env("KERNEL_HEADLESS", false);
+    let stealth = parse_bool_env("KERNEL_STEALTH", true);
     let timeout_seconds = env::var("KERNEL_TIMEOUT_SECONDS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(300);
+    let profile_name = env::var("KERNEL_PROFILE_NAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let client = reqwest::Client::new();
 
     let mut body = json!({
         "headless": headless,
@@ -297,15 +307,13 @@ async fn connect_kernel() -> Result<(String, Option<ProviderSession>), String> {
         "timeout_seconds": timeout_seconds,
     });
 
-    if let Ok(profile) = env::var("KERNEL_PROFILE_NAME") {
-        if !profile.is_empty() {
-            body.as_object_mut()
-                .unwrap()
-                .insert("profile".to_string(), json!(profile));
-        }
+    if let Some(profile) = profile_name.as_deref() {
+        ensure_kernel_profile(&client, &endpoint, api_key.as_deref(), profile).await?;
+        body.as_object_mut()
+            .unwrap()
+            .insert("profile".to_string(), kernel_profile_payload(profile));
     }
 
-    let client = reqwest::Client::new();
     let mut request = client.post(&url).header("Content-Type", "application/json");
     if let Some(ref key) = api_key {
         request = request.header("Authorization", format!("Bearer {}", key));
@@ -353,12 +361,131 @@ async fn connect_kernel() -> Result<(String, Option<ProviderSession>), String> {
                 .to_string()
         })?;
 
+    // Kernel accepts profile in the create payload. Some API deployments return
+    // profile:null even when they loaded it, and some require an explicit update.
+    if let Some(profile) = profile_name.as_deref() {
+        if json.get("profile").is_none() || json.get("profile") == Some(&Value::Null) {
+            if let Err(err) =
+                attach_kernel_profile(&client, &endpoint, api_key.as_deref(), &session_id, profile)
+                    .await
+            {
+                let _ = close_provider_session(&ProviderSession {
+                    provider: "kernel".to_string(),
+                    session_id: session_id.clone(),
+                })
+                .await;
+                return Err(err);
+            }
+        }
+    }
+
     Ok((
         ws_url,
         Some(ProviderSession {
             provider: "kernel".to_string(),
             session_id,
         }),
+    ))
+}
+
+fn parse_bool_env(name: &str, default: bool) -> bool {
+    env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
+
+fn kernel_profile_payload(profile: &str) -> Value {
+    json!({
+        "name": profile,
+        "save_changes": true,
+    })
+}
+
+async fn attach_kernel_profile(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    session_id: &str,
+    profile: &str,
+) -> Result<(), String> {
+    let url = format!("{}/browsers/{}", endpoint.trim_end_matches('/'), session_id);
+    let mut request = client.patch(url).header("Content-Type", "application/json");
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = request
+        .json(&json!({
+            "profile": kernel_profile_payload(profile),
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Kernel profile attach request failed: {}", e))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Kernel profile attach response: {}", e))?;
+
+    if !status.is_success() {
+        if provider_error_code(&body).as_deref() == Some("profile_already_loaded") {
+            return Ok(());
+        }
+        return Err(format!(
+            "Kernel profile attach API error ({}): {}",
+            status.as_u16(),
+            body
+        ));
+    }
+
+    let json: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Invalid Kernel profile attach response: {}", e))?;
+    if json.get("profile").is_none() || json.get("profile") == Some(&Value::Null) {
+        return Err("Kernel profile attach response missing profile".to_string());
+    }
+
+    Ok(())
+}
+
+async fn ensure_kernel_profile(
+    client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+    profile: &str,
+) -> Result<(), String> {
+    let url = format!("{}/profiles", endpoint.trim_end_matches('/'));
+    let mut request = client.post(url).header("Content-Type", "application/json");
+    if let Some(key) = api_key {
+        request = request.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = request
+        .json(&json!({ "name": profile }))
+        .send()
+        .await
+        .map_err(|e| format!("Kernel profile create request failed: {}", e))?;
+
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Kernel profile create response: {}", e))?;
+
+    if status.is_success() {
+        return Ok(());
+    }
+
+    if matches!(
+        provider_error_code(&body).as_deref(),
+        Some("profile_already_exists" | "already_exists" | "conflict")
+    ) || status.as_u16() == 409
+    {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Kernel profile create API error ({}): {}",
+        status.as_u16(),
+        body
     ))
 }
 
@@ -757,6 +884,56 @@ mod tests {
         let result = rt.block_on(connect_provider("unknown-provider"));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown provider"));
+    }
+
+    #[test]
+    fn test_kernel_defaults_favor_stealth() {
+        std::env::remove_var("KERNEL_HEADLESS");
+        std::env::remove_var("KERNEL_STEALTH");
+
+        assert!(!parse_bool_env("KERNEL_HEADLESS", false));
+        assert!(parse_bool_env("KERNEL_STEALTH", true));
+    }
+
+    #[test]
+    fn test_parse_bool_env_variants() {
+        std::env::set_var("AGENT_BROWSER_TEST_BOOL", "true");
+        assert!(parse_bool_env("AGENT_BROWSER_TEST_BOOL", false));
+
+        std::env::set_var("AGENT_BROWSER_TEST_BOOL", "false");
+        assert!(!parse_bool_env("AGENT_BROWSER_TEST_BOOL", true));
+
+        std::env::remove_var("AGENT_BROWSER_TEST_BOOL");
+        assert!(parse_bool_env("AGENT_BROWSER_TEST_BOOL", true));
+    }
+
+    #[test]
+    fn test_kernel_profile_payload_shape() {
+        assert_eq!(
+            kernel_profile_payload("hermes-default"),
+            json!({
+                "name": "hermes-default",
+                "save_changes": true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_provider_error_code_flat_json() {
+        assert_eq!(
+            provider_error_code(
+                r#"{"code":"profile_already_loaded","message":"Profile already loaded"}"#
+            ),
+            Some("profile_already_loaded".to_string())
+        );
+    }
+
+    #[test]
+    fn test_provider_error_code_nested_json() {
+        assert_eq!(
+            provider_error_code(r#"{"error":{"code":"conflict","message":"Profile exists"}}"#),
+            Some("conflict".to_string())
+        );
     }
 
     #[test]

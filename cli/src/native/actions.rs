@@ -201,6 +201,7 @@ fn launch_hash(opts: &LaunchOptions) -> u64 {
 
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
+    pub provider_session: Option<providers::ProviderSession>,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
@@ -266,6 +267,7 @@ impl DaemonState {
     pub fn new() -> Self {
         Self {
             browser: None,
+            provider_session: None,
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
@@ -1251,6 +1253,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
                 if let Some(ref mut mgr) = state.browser {
                     let _ = mgr.close().await;
                 }
+                if let Some(provider_session) = state.provider_session.take() {
+                    let _ = providers::close_provider_session(&provider_session).await;
+                }
                 state.browser = None;
                 state.screencasting = false;
                 state.reset_input_state();
@@ -1543,6 +1548,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
         state.reset_input_state();
         state.browser = Some(mgr);
+        state.provider_session = None;
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -1556,6 +1562,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
     if env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok() {
         state.reset_input_state();
         state.browser = Some(connect_auto_with_fresh_tab().await?);
+        state.provider_session = None;
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -1591,6 +1598,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
                 Ok(mgr) => {
                     state.reset_input_state();
                     state.browser = Some(mgr);
+                    state.provider_session = conn.session;
                     state.subscribe_to_browser_events();
                     state.start_fetch_handler();
                     state.start_dialog_handler();
@@ -1603,7 +1611,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
                 }
                 Err(e) => {
                     if let Some(ref ps) = conn.session {
-                        providers::close_provider_session(ps).await;
+                        let _ = providers::close_provider_session(ps).await;
                     }
                     return Err(format!("Provider '{}' connection failed: {}", p, e));
                 }
@@ -1615,6 +1623,7 @@ async fn auto_launch(state: &mut DaemonState) -> Result<(), String> {
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
+    state.provider_session = None;
     state.launch_hash = Some(hash);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
@@ -1916,6 +1925,9 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if needs_relaunch {
         if let Some(ref mut b) = state.browser {
             b.close().await?;
+            if let Some(provider_session) = state.provider_session.take() {
+                let _ = providers::close_provider_session(&provider_session).await;
+            }
             state.browser = None;
             state.launch_hash = None;
             state.screencasting = false;
@@ -2002,6 +2014,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     Ok(mgr) => {
                         state.reset_input_state();
                         state.browser = Some(mgr);
+                        state.provider_session = conn.session;
                         state.subscribe_to_browser_events();
                         state.start_fetch_handler();
                         state.start_dialog_handler();
@@ -2023,7 +2036,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     }
                     Err(e) => {
                         if let Some(ref ps) = conn.session {
-                            providers::close_provider_session(ps).await;
+                            let _ = providers::close_provider_session(ps).await;
                         }
                         return Err(e);
                     }
@@ -2405,6 +2418,9 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
     }
     if let Some(ref mut mgr) = state.browser {
         mgr.close().await?;
+    }
+    if let Some(provider_session) = state.provider_session.take() {
+        let _ = providers::close_provider_session(&provider_session).await;
     }
     state.browser = None;
     state.launch_hash = None;
